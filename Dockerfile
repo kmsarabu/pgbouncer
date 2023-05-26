@@ -11,7 +11,7 @@ ENV DBALIAS=${DBALIAS:-oktank}
 ENV PGBOUNCERPORT=${PGBOUNCERPORT:-6432}
 
 RUN yum -y update && \
-    yum -y install git tar gcc openssl-devel openssl-perl openssl-static libevent-devel pam pam-devel wget
+    yum -y install git tar gcc openssl-devel openssl-perl openssl-static libevent-devel pam pam-devel wget sudo
 
 RUN wget -O pgbouncer.tar.gz https://www.pgbouncer.org/downloads/files/$PGBOUNCER_VERSION/pgbouncer-${PGBOUNCER_VERSION}.tar.gz && \
     tar -xvxf pgbouncer.tar.gz && \
@@ -21,6 +21,8 @@ RUN wget -O pgbouncer.tar.gz https://www.pgbouncer.org/downloads/files/$PGBOUNCE
     make install && \
     cd .. && \
     rm -rf pgbouncer.tar.gz pgbouncer-${PGBOUNCER_VERSION}
+
+RUN /usr/bin/sudo amazon-linux-extras install postgresql14
 
 COPY config/pgbouncer.sample.ini /etc/pgbouncer/pgbouncer.sample.ini
 COPY prepare_config.sh /tmp/
