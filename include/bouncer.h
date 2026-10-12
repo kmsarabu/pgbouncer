@@ -473,6 +473,7 @@ struct PgPool {
 	bool last_login_failed : 1;
 
 	bool welcome_msg_ready : 1;
+	bool welcome_hot_standby : 1;	/* welcome_msg has in_hot_standby=on */
 
 	uint16_t rrcounter;		/* round-robin counter */
 };

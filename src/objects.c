@@ -1343,6 +1343,47 @@ static void unlink_server(PgSocket *server, const char *reason)
 		disconnect_client(client, true, "bouncer config error");
 }
 
+/* how long an idle server's in_hot_standby=on is trusted for new clients */
+#define HOT_STANDBY_RECHECK_INTERVAL USEC
+
+/*
+ * A standby that gets promoted keeps its server connections, and Postgres
+ * only reports the new in_hot_standby value once a server runs a command.
+ * Clients that look for a primary log out right after seeing
+ * in_hot_standby=on, so without other traffic the cached value would never
+ * get refreshed.  Run an empty query on an idle server, or log in a new
+ * server if there is none, so the next client gets a fresh value.
+ */
+void recheck_hot_standby(PgPool *pool)
+{
+	PgSocket *server;
+	bool res;
+
+	if (cf_pause_mode != P_NONE || pool->db->db_paused)
+		return;
+
+	/* busy servers and logins in progress report the current value anyway */
+	if (pool_server_count(pool) == 0) {
+		launch_new_connection(pool, /* evict_if_needed= */ false);
+		return;
+	}
+
+	/* idle servers are moved to used_server_list after server_check_delay */
+	server = first_socket(&pool->idle_server_list);
+	if (!server)
+		server = first_socket(&pool->used_server_list);
+	if (!server || !server->ready || server->close_needed)
+		return;
+	if (get_cached_time() - server->request_time < HOT_STANDBY_RECHECK_INTERVAL)
+		return;
+
+	slog_debug(server, "P: checking in_hot_standby");
+	change_server_state(server, SV_TESTED);
+	SEND_generic(res, server, PqMsg_Query, "s", "\0");
+	if (!res)
+		disconnect_server(server, false, "in_hot_standby check failed");
+}
+
 /*
  * close server connection
  *
@@ -2395,6 +2436,7 @@ void tag_pool_dirty(PgPool *pool)
 		pool->welcome_msg = NULL;
 	}
 	pool->welcome_msg_ready = false;
+	pool->welcome_hot_standby = false;
 
 	/* drop all existing servers ASAP */
 	for_each_server(pool, tag_dirty);

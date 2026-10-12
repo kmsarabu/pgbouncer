@@ -331,6 +331,13 @@ PktBuf *new_welcome_msg(void)
 	return msg;
 }
 
+/* remember if the cached welcome msg says the server is a hot standby */
+static void note_hot_standby(PgPool *pool, const char *key, const char *val)
+{
+	if (strcmp(key, "in_hot_standby") == 0)
+		pool->welcome_hot_standby = strcmp(val, "on") == 0;
+}
+
 /* add another server parameter packet to cache */
 bool add_welcome_parameter(PgPool *pool, const char *key, const char *val)
 {
@@ -339,10 +346,102 @@ bool add_welcome_parameter(PgPool *pool, const char *key, const char *val)
 	if (pool->welcome_msg_ready)
 		return true;
 
+	note_hot_standby(pool, key, val);
+
 	/* if not stored in ->orig_vars, write full packet */
 	if (!varcache_set(&pool->orig_vars, key, val))
 		pktbuf_write_ParameterStatus(msg, key, val);
 
+	return !msg->failed;
+}
+
+/* find value of a ParameterStatus packet in welcome msg, NULL if not there */
+static const char *find_welcome_parameter(const PktBuf *msg, const char *key)
+{
+	struct MBuf data;
+	PktHdr pkt;
+	const char *k, *v;
+
+	mbuf_init_fixed_reader(&data, msg->buf, msg->write_pos);
+	while (mbuf_avail_for_read(&data) > 0) {
+		if (!get_header(&data, &pkt))
+			return NULL;
+		if (pkt.type != PqMsg_ParameterStatus)
+			continue;
+		if (!mbuf_get_string(&pkt.data, &k) || !mbuf_get_string(&pkt.data, &v))
+			return NULL;
+		if (strcmp(k, key) == 0)
+			return v;
+	}
+	return NULL;
+}
+
+/* rebuild welcome msg with new value for an existing parameter */
+static bool replace_welcome_parameter(PgPool *pool, const char *key, const char *val)
+{
+	PktBuf *old = pool->welcome_msg;
+	PktBuf *msg;
+	struct MBuf data;
+	PktHdr pkt;
+	const char *k;
+	unsigned pos = 0;
+
+	msg = pktbuf_dynamic(old->write_pos + 64);
+	if (!msg)
+		return false;
+
+	mbuf_init_fixed_reader(&data, old->buf, old->write_pos);
+	while (mbuf_avail_for_read(&data) > 0) {
+		if (!get_header(&data, &pkt))
+			goto failed;
+		if (pkt.type == PqMsg_ParameterStatus
+		    && mbuf_get_string(&pkt.data, &k) && strcmp(k, key) == 0)
+			pktbuf_write_ParameterStatus(msg, key, val);
+		else
+			pktbuf_put_bytes(msg, old->buf + pos, pkt.len);
+		pos += pkt.len;
+	}
+	if (msg->failed)
+		goto failed;
+
+	pktbuf_free(old);
+	pool->welcome_msg = msg;
+	return true;
+failed:
+	pktbuf_free(msg);
+	return false;
+}
+
+/*
+ * Refresh a parameter in an already finished welcome msg.
+ *
+ * Without this, the parameters of the first server connection would be sent
+ * to every new client until the pool gets tagged dirty.  That breaks clients
+ * that look at in_hot_standby to pick a primary (libpq target_session_attrs,
+ * pgjdbc targetServerType, Npgsql TargetSessionAttributes) after a failover
+ * or a standby promotion.
+ */
+bool update_welcome_parameter(PgSocket *server, const char *key, const char *val)
+{
+	PgPool *pool = server->pool;
+	PktBuf *msg = pool->welcome_msg;
+	const char *cur;
+
+	if (!pool->welcome_msg_ready)
+		return true;
+
+	cur = find_welcome_parameter(msg, key);
+	if (cur && strcmp(cur, val) == 0)
+		return true;
+
+	slog_info(server, "server parameter %s changed from \"%s\" to \"%s\", updating welcome message",
+		  key, cur ? cur : "", val);
+	note_hot_standby(pool, key, val);
+
+	if (cur)
+		return replace_welcome_parameter(pool, key, val);
+
+	pktbuf_write_ParameterStatus(msg, key, val);
 	return !msg->failed;
 }
 
@@ -447,6 +546,11 @@ bool welcome_client(PgSocket *client)
 		disconnect_client(client, true, "failed to send welcome message");
 		return false;
 	}
+
+	/* make sure in_hot_standby=on is still true for the next client */
+	if (pool->welcome_hot_standby)
+		recheck_hot_standby(pool);
+
 	return true;
 }
 
